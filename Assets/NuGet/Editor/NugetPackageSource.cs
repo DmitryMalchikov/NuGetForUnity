@@ -86,6 +86,11 @@
         public bool IsLocalPath { get; private set; }
 
         /// <summary>
+        /// Get or sets a value indicating if this is a local path that is 3.3+;
+        /// </summary>
+        public bool IsLocalPathAndVersion33 { get; set; }
+
+        /// <summary>
         /// Gets or sets a value indicated whether this source is enabled or not.
         /// </summary>
         public bool IsEnabled { get; set; }
@@ -100,6 +105,7 @@
             Name = name;
             SavedPath = path;
             IsLocalPath = !ExpandedPath.StartsWith("http");
+            IsLocalPathAndVersion33 = getIsLocalPathAndVersion33OrHigher();
             IsEnabled = true;
         }
 
@@ -114,7 +120,18 @@
 
             if (IsLocalPath)
             {
-                if (!package.HasVersionRange)
+                // determine local path
+                string localPackagePath;
+                if (IsLocalPathAndVersion33)
+                {
+                  localPackagePath = NugetPackage.PathLocal33Get(ExpandedPath, package.Id, package.Version);
+                }
+                else
+                {
+                  localPackagePath = NugetPackage.PathLocalGet(ExpandedPath, package.Id, package.Version);
+                }
+                
+                if (File.Exists(localPackagePath))
                 {
                     string localPackagePath = Path.Combine(ExpandedPath, string.Format("./{0}.{1}.nupkg", package.Id, package.Version));
                     if (File.Exists(localPackagePath))
@@ -126,8 +143,10 @@
                 }
                 else
                 {
-                    // TODO: Optimize to no longer use GetLocalPackages, since that loads the .nupkg itself
-                    foundPackages = GetLocalPackages(package.Id, true, true);
+
+                    // Try to find later versions of the same package
+                    var packages = GetLocalPackages(package.Id, true, true);
+                    foundPackages = new List<NugetPackage>(packages.SkipWhile(x => !package.InRange(x)));
                 }
             }
             else
@@ -259,6 +278,8 @@
         /// <returns>The list of available packages.</returns>
         private List<NugetPackage> GetLocalPackages(string searchTerm = "", bool includeAllVersions = false, bool includePrerelease = false, int numberToGet = 15, int numberToSkip = 0)
         {
+            NugetHelper.LogVerbose("{0}: Getting local packages {1}", typeof(NugetPackageSource).Name, ExpandedPath);
+
             List<NugetPackage> localPackages = new List<NugetPackage>();
 
             if (numberToSkip != 0)
@@ -271,7 +292,52 @@
 
             if (Directory.Exists(path))
             {
-                string[] packagePaths = Directory.GetFiles(path, string.Format("*{0}*.nupkg", searchTerm));
+                List<string> packagePaths = new List<string>();
+
+                if (!IsLocalPathAndVersion33) // 3.3-
+                {
+                    packagePaths.AddRange(Directory.GetFiles(path, string.Format("*{0}*.nupkg", searchTerm))); // adding loose packages
+                }
+                else // 3.3+
+                {
+                    // https://docs.microsoft.com/en-us/nuget/hosting-packages/local-feeds
+
+                    // hierarchy of local feed
+                    // 0.\\myserver\packages
+                    // 1. └─<packageID>
+                    // 2. └─<version>
+                    // 3.   ├─<packageID>.<version>.nupkg
+                    // 4.   └─<other files>
+
+                    string aPackage = "";
+
+                    // nuget v3 support
+                    foreach (DirectoryInfo aDirPackageID in new DirectoryInfo(path).GetDirectories(string.Format("*{0}*", searchTerm))) // 0; for each package directory which matches the terms
+                    {
+                        NugetHelper.LogVerbose("{0}: Found a matching directory {1}", typeof(NugetPackageSource).Name, aDirPackageID);
+
+                        aPackage = aDirPackageID.Name; // example: sinedustries.collections
+
+                        //~ could optimize version checks while iterating?
+
+                        foreach (DirectoryInfo aDirVersion in aDirPackageID.GetDirectories()) // 1; for each version directory for a package directory
+                        {
+                            NugetHelper.LogVerbose("{0}: Found a version directory {1}", typeof(NugetPackageSource).Name, aDirVersion);
+
+                            aPackage = NugetPackage.PathLocal33Get(path, aDirPackageID.Name, aDirVersion.Name); // 2; path for package;
+
+                            if (File.Exists(aPackage)) // expected package exists
+                            {
+                                packagePaths.Add(aPackage); // add the package to paths
+                                NugetHelper.LogVerbose("{0}: Added package {1}", typeof(NugetPackageSource).Name, aPackage);
+                            }
+                            else // no find path
+                            {
+                                throw new FileNotFoundException("Could not find NuGet package: {0};", aPackage);
+                            }
+                        }
+                    }
+                }
 
                 foreach (var packagePath in packagePaths)
                 {
@@ -288,7 +354,7 @@
                     {
                         // if all versions are being included, simply add it and move on
                         localPackages.Add(package);
-                        //LogVerbose("Adding {0} {1}", package.Id, package.Version);
+                        NugetHelper.LogVerbose("Adding {0} {1}", package.Id, package.Version);
                         continue;
                     }
 
@@ -480,6 +546,17 @@
             return updates;
         }
 
+        /// <summary>
+        /// Path to all the nuget packages in a folder;
+        /// </summary>
+        static public IEnumerable<string> GetPathsInFolder(string path, string searchTerm)
+        {
+            foreach (string pathPackage in Directory.GetFiles(path, string.Format("*{0}*.nupkg", searchTerm))) // here is where the files are got!
+            {
+                yield return pathPackage;
+            }
+        }
+
         private static void ComparePackageLists(List<NugetPackage> updates, List<NugetPackage> updatesReplacement, string errorMessageToDisplayIfListsDoNotMatch)
         {
             System.Text.StringBuilder matchingComparison = new System.Text.StringBuilder();
@@ -533,7 +610,12 @@
             {
                 string versionRange = string.Format("({0},)", installedPackage.Version); // Minimum of Current ID (exclusive) with no maximum (exclusive).
                 NugetPackageIdentifier id = new NugetPackageIdentifier(installedPackage.Id, versionRange);
+
                 List<NugetPackage> packageUpdates = FindPackagesById(id);
+                packageUpdates = FindPackagesById(id);
+
+                NugetPackage mostRecentPrerelease = includePrerelease ? packageUpdates.FindLast(p => p.IsPrerelease) : default(NugetPackage);
+                packageUpdates.RemoveAll(p => p.IsPrerelease && p != mostRecentPrerelease);
 
                 if (!includePrerelease) { packageUpdates.RemoveAll(p => p.IsPrerelease); }
                 if( packageUpdates.Count == 0 ) { continue; }
@@ -545,5 +627,14 @@
             NugetHelper.LogVerbose("NugetPackageSource.GetUpdatesFallback took {0} ms", stopwatch.ElapsedMilliseconds);
             return updates;
         }
+
+        /// <summary>
+        /// Get if this <see cref="IsLocalPath"/> and the version is 3.3 or higher;
+        /// </summary>
+        private bool getIsLocalPathAndVersion33OrHigher()
+        =>
+            IsLocalPath
+            && Directory.Exists(SavedPath) // may be the aggregate sources, which does not exist
+            && Directory.GetDirectories(SavedPath)?.Length > 0; // there are directories
     }
 }
